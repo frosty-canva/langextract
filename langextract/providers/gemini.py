@@ -30,192 +30,204 @@ from langextract.providers import registry
 
 
 @registry.register(
-    r'^gemini',  # gemini-2.5-flash, gemini-2.5-pro, etc.
+    r"^gemini",  # gemini-2.5-flash, gemini-2.5-pro, etc.
     priority=10,
 )
 @dataclasses.dataclass(init=False)
 class GeminiLanguageModel(inference.BaseLanguageModel):
-  """Language model inference using Google's Gemini API with structured output."""
+    """Language model inference using Google's Gemini API with structured output."""
 
-  model_id: str = 'gemini-2.5-flash'
-  api_key: str | None = None
-  project: str | None = None
-  location: str | None = None
-  gemini_schema: schema.GeminiSchema | None = None
-  format_type: data.FormatType = data.FormatType.JSON
-  temperature: float = 0.0
-  max_workers: int = 10
-  fence_output: bool = False
-  _extra_kwargs: dict[str, Any] = dataclasses.field(
-      default_factory=dict, repr=False, compare=False
-  )
-
-  def __init__(
-      self,
-      model_id: str = 'gemini-2.5-flash',
-      api_key: str | None = None,
-      project: str | None = None,
-      location: str | None = None,
-      gemini_schema: schema.GeminiSchema | None = None,
-      format_type: data.FormatType = data.FormatType.JSON,
-      temperature: float = 0.0,
-      max_workers: int = 10,
-      fence_output: bool = False,
-      **kwargs,
-  ) -> None:
-    """Initialize the Gemini language model.
-
-    Args:
-      model_id: The Gemini model ID to use.
-      api_key: API key for Gemini service.
-      gemini_schema: Optional schema for structured output.
-      format_type: Output format (JSON or YAML).
-      temperature: Sampling temperature.
-      max_workers: Maximum number of parallel API calls.
-      fence_output: Whether to wrap output in markdown fences (ignored,
-        Gemini handles this based on schema).
-      **kwargs: Ignored extra parameters so callers can pass a superset of
-        arguments shared across back-ends without raising ``TypeError``.
-    """
-    try:
-      # pylint: disable=import-outside-toplevel
-      from google import genai
-    except ImportError as e:
-      raise exceptions.InferenceConfigError(
-          'Failed to import google-genai. Reinstall: pip install langextract'
-      ) from e
-
-    self.model_id = model_id
-    self.api_key = api_key
-    self.project = project
-    self.location = location
-    self.gemini_schema = gemini_schema
-    self.format_type = format_type
-    self.temperature = temperature
-    self.max_workers = max_workers
-    self.fence_output = (
-        fence_output  # Store but may not use depending on schema
+    model_id: str = "gemini-2.5-flash"
+    api_key: str | None = None
+    project: str | None = None
+    location: str | None = None
+    gemini_schema: schema.GeminiSchema | None = None
+    format_type: data.FormatType = data.FormatType.JSON
+    temperature: float = 0.0
+    max_workers: int = 10
+    fence_output: bool = False
+    _extra_kwargs: dict[str, Any] = dataclasses.field(
+        default_factory=dict, repr=False, compare=False
     )
-    self._extra_kwargs = kwargs or {}
 
-    # Initialize client: prefer API key (Google AI), otherwise fall back to Vertex AI via ADC
-    if self.api_key:
-      self._client = genai.Client(api_key=self.api_key)
-    else:
-      # Resolve project and location for Vertex AI
-      project_id = self.project or os.getenv('GOOGLE_CLOUD_PROJECT') or os.getenv('GCLOUD_PROJECT')
-      resolved_location = self.location or os.getenv('GOOGLE_CLOUD_LOCATION') or os.getenv('VERTEX_AI_LOCATION') or 'us-central1'
+    def __init__(
+        self,
+        model_id: str = "gemini-2.5-flash",
+        api_key: str | None = None,
+        project: str | None = None,
+        location: str | None = None,
+        gemini_schema: schema.GeminiSchema | None = None,
+        format_type: data.FormatType = data.FormatType.JSON,
+        temperature: float = 0.0,
+        max_workers: int = 10,
+        fence_output: bool = False,
+        **kwargs,
+    ) -> None:
+        """Initialize the Gemini language model.
 
-      if not project_id:
-        # Try to get project from ADC
+        Args:
+          model_id: The Gemini model ID to use.
+          api_key: API key for Gemini service.
+          gemini_schema: Optional schema for structured output.
+          format_type: Output format (JSON or YAML).
+          temperature: Sampling temperature.
+          max_workers: Maximum number of parallel API calls.
+          fence_output: Whether to wrap output in markdown fences (ignored,
+            Gemini handles this based on schema).
+          **kwargs: Ignored extra parameters so callers can pass a superset of
+            arguments shared across back-ends without raising ``TypeError``.
+        """
         try:
-          # pylint: disable=import-outside-toplevel
-          import google.auth  # type: ignore
-          _, detected_project = google.auth.default()
-          project_id = detected_project
-        except Exception:
-          project_id = None
-
-      if not project_id:
-        raise exceptions.InferenceConfigError(
-            'Gemini API key not provided and no Google Cloud project detected. '
-            'To use Vertex AI, authenticate with "gcloud auth application-default login" '
-            'and set a project (e.g., export GOOGLE_CLOUD_PROJECT=YOUR_PROJECT) or '
-            'pass project/location to the provider.'
-        )
-
-      try:
-        self._client = genai.Client(vertexai=True, project=project_id, location=resolved_location)
-      except Exception as e:
-        raise exceptions.InferenceConfigError(
-            f'Failed to initialize Vertex AI client (project={project_id}, location={resolved_location}). '
-            'Ensure ADC is configured and Vertex AI API is enabled.'
-        ) from e
-
-    super().__init__(
-        constraint=schema.Constraint(constraint_type=schema.ConstraintType.NONE)
-    )
-
-  def _process_single_prompt(
-      self, prompt: str, config: dict
-  ) -> inference.ScoredOutput:
-    """Process a single prompt and return a ScoredOutput."""
-    try:
-      if self.gemini_schema:
-        response_schema = self.gemini_schema.schema_dict
-        mime_type = (
-            'application/json'
-            if self.format_type == data.FormatType.JSON
-            else 'application/yaml'
-        )
-        config['response_mime_type'] = mime_type
-        config['response_schema'] = response_schema
-
-      response = self._client.models.generate_content(
-          model=self.model_id, contents=prompt, config=config  # type: ignore[arg-type]
-      )
-
-      return inference.ScoredOutput(score=1.0, output=response.text)
-
-    except Exception as e:
-      raise exceptions.InferenceRuntimeError(
-          f'Gemini API error: {str(e)}', original=e
-      ) from e
-
-  def infer(
-      self, batch_prompts: Sequence[str], **kwargs
-  ) -> Iterator[Sequence[inference.ScoredOutput]]:
-    """Runs inference on a list of prompts via Gemini's API.
-
-    Args:
-      batch_prompts: A list of string prompts.
-      **kwargs: Additional generation params (temperature, top_p, top_k, etc.)
-
-    Yields:
-      Lists of ScoredOutputs.
-    """
-    config = {
-        'temperature': kwargs.get('temperature', self.temperature),
-    }
-    if 'max_output_tokens' in kwargs:
-      config['max_output_tokens'] = kwargs['max_output_tokens']
-    if 'top_p' in kwargs:
-      config['top_p'] = kwargs['top_p']
-    if 'top_k' in kwargs:
-      config['top_k'] = kwargs['top_k']
-
-    # Use parallel processing for batches larger than 1
-    if len(batch_prompts) > 1 and self.max_workers > 1:
-      with concurrent.futures.ThreadPoolExecutor(
-          max_workers=min(self.max_workers, len(batch_prompts))
-      ) as executor:
-        future_to_index = {
-            executor.submit(
-                self._process_single_prompt, prompt, config.copy()
-            ): i
-            for i, prompt in enumerate(batch_prompts)
-        }
-
-        results: list[inference.ScoredOutput | None] = [None] * len(
-            batch_prompts
-        )
-        for future in concurrent.futures.as_completed(future_to_index):
-          index = future_to_index[future]
-          try:
-            results[index] = future.result()
-          except Exception as e:
-            raise exceptions.InferenceRuntimeError(
-                f'Parallel inference error: {str(e)}', original=e
+            # pylint: disable=import-outside-toplevel
+            from google import genai
+        except ImportError as e:
+            raise exceptions.InferenceConfigError(
+                "Failed to import google-genai. Reinstall: pip install langextract"
             ) from e
 
-        for result in results:
-          if result is None:
-            raise exceptions.InferenceRuntimeError(
-                'Failed to process one or more prompts'
+        self.model_id = model_id
+        self.api_key = api_key
+        self.project = project
+        self.location = location
+        self.gemini_schema = gemini_schema
+        self.format_type = format_type
+        self.temperature = temperature
+        self.max_workers = max_workers
+        self.fence_output = fence_output  # Store but may not use depending on schema
+        self._extra_kwargs = kwargs or {}
+
+        # Initialize client: prefer API key (Google AI), otherwise fall back to Vertex AI via ADC
+        if self.api_key:
+            self._client = genai.Client(api_key=self.api_key)
+        else:
+            # Resolve project and location for Vertex AI
+            project_id = (
+                self.project
+                or os.getenv("GOOGLE_CLOUD_PROJECT")
+                or os.getenv("GCLOUD_PROJECT")
             )
-          yield [result]
-    else:
-      # Sequential processing for single prompt or worker
-      for prompt in batch_prompts:
-        result = self._process_single_prompt(prompt, config.copy())
-        yield [result]
+            resolved_location = (
+                self.location
+                or os.getenv("GOOGLE_CLOUD_LOCATION")
+                or os.getenv("VERTEX_AI_LOCATION")
+                or "us-central1"
+            )
+
+            if not project_id:
+                # Try to get project from ADC
+                try:
+                    # pylint: disable=import-outside-toplevel
+                    import google.auth  # type: ignore
+
+                    _, detected_project = google.auth.default()
+                    project_id = detected_project
+                except Exception:
+                    project_id = None
+
+            if not project_id:
+                raise exceptions.InferenceConfigError(
+                    "Gemini API key not provided and no Google Cloud project detected. "
+                    'To use Vertex AI, authenticate with "gcloud auth application-default login" '
+                    "and set a project (e.g., export GOOGLE_CLOUD_PROJECT=YOUR_PROJECT) or "
+                    "pass project/location to the provider."
+                )
+
+            try:
+                self._client = genai.Client(
+                    vertexai=True, project=project_id, location=resolved_location
+                )
+            except Exception as e:
+                raise exceptions.InferenceConfigError(
+                    f"Failed to initialize Vertex AI client (project={project_id}, location={resolved_location}). "
+                    "Ensure ADC is configured and Vertex AI API is enabled."
+                ) from e
+
+        super().__init__(
+            constraint=schema.Constraint(constraint_type=schema.ConstraintType.NONE)
+        )
+
+    def _process_single_prompt(
+        self, prompt: str, config: dict
+    ) -> inference.ScoredOutput:
+        """Process a single prompt and return a ScoredOutput."""
+        try:
+            if self.gemini_schema:
+                response_schema = self.gemini_schema.schema_dict
+                mime_type = (
+                    "application/json"
+                    if self.format_type == data.FormatType.JSON
+                    else "application/yaml"
+                )
+                config["response_mime_type"] = mime_type
+                config["response_schema"] = response_schema
+
+            response = self._client.models.generate_content(
+                model=self.model_id,
+                contents=prompt,
+                config=config,  # type: ignore[arg-type]
+            )
+
+            return inference.ScoredOutput(score=1.0, output=response.text)
+
+        except Exception as e:
+            raise exceptions.InferenceRuntimeError(
+                f"Gemini API error: {str(e)}", original=e
+            ) from e
+
+    def infer(
+        self, batch_prompts: Sequence[str], **kwargs
+    ) -> Iterator[Sequence[inference.ScoredOutput]]:
+        """Runs inference on a list of prompts via Gemini's API.
+
+        Args:
+          batch_prompts: A list of string prompts.
+          **kwargs: Additional generation params (temperature, top_p, top_k, etc.)
+
+        Yields:
+          Lists of ScoredOutputs.
+        """
+        config = {
+            "temperature": kwargs.get("temperature", self.temperature),
+        }
+        if "max_output_tokens" in kwargs:
+            config["max_output_tokens"] = kwargs["max_output_tokens"]
+        if "top_p" in kwargs:
+            config["top_p"] = kwargs["top_p"]
+        if "top_k" in kwargs:
+            config["top_k"] = kwargs["top_k"]
+
+        # Use parallel processing for batches larger than 1
+        if len(batch_prompts) > 1 and self.max_workers > 1:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(self.max_workers, len(batch_prompts))
+            ) as executor:
+                future_to_index = {
+                    executor.submit(
+                        self._process_single_prompt, prompt, config.copy()
+                    ): i
+                    for i, prompt in enumerate(batch_prompts)
+                }
+
+                results: list[inference.ScoredOutput | None] = [None] * len(
+                    batch_prompts
+                )
+                for future in concurrent.futures.as_completed(future_to_index):
+                    index = future_to_index[future]
+                    try:
+                        results[index] = future.result()
+                    except Exception as e:
+                        raise exceptions.InferenceRuntimeError(
+                            f"Parallel inference error: {str(e)}", original=e
+                        ) from e
+
+                for result in results:
+                    if result is None:
+                        raise exceptions.InferenceRuntimeError(
+                            "Failed to process one or more prompts"
+                        )
+                    yield [result]
+        else:
+            # Sequential processing for single prompt or worker
+            for prompt in batch_prompts:
+                result = self._process_single_prompt(prompt, config.copy())
+                yield [result]
