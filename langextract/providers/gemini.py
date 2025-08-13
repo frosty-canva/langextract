@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import os
 from typing import Any, Iterator, Sequence
 
 from langextract import data
@@ -38,6 +39,8 @@ class GeminiLanguageModel(inference.BaseLanguageModel):
 
   model_id: str = 'gemini-2.5-flash'
   api_key: str | None = None
+  project: str | None = None
+  location: str | None = None
   gemini_schema: schema.GeminiSchema | None = None
   format_type: data.FormatType = data.FormatType.JSON
   temperature: float = 0.0
@@ -51,6 +54,8 @@ class GeminiLanguageModel(inference.BaseLanguageModel):
       self,
       model_id: str = 'gemini-2.5-flash',
       api_key: str | None = None,
+      project: str | None = None,
+      location: str | None = None,
       gemini_schema: schema.GeminiSchema | None = None,
       format_type: data.FormatType = data.FormatType.JSON,
       temperature: float = 0.0,
@@ -82,6 +87,8 @@ class GeminiLanguageModel(inference.BaseLanguageModel):
 
     self.model_id = model_id
     self.api_key = api_key
+    self.project = project
+    self.location = location
     self.gemini_schema = gemini_schema
     self.format_type = format_type
     self.temperature = temperature
@@ -91,10 +98,39 @@ class GeminiLanguageModel(inference.BaseLanguageModel):
     )
     self._extra_kwargs = kwargs or {}
 
-    if not self.api_key:
-      raise exceptions.InferenceConfigError('API key not provided for Gemini.')
+    # Initialize client: prefer API key (Google AI), otherwise fall back to Vertex AI via ADC
+    if self.api_key:
+      self._client = genai.Client(api_key=self.api_key)
+    else:
+      # Resolve project and location for Vertex AI
+      project_id = self.project or os.getenv('GOOGLE_CLOUD_PROJECT') or os.getenv('GCLOUD_PROJECT')
+      resolved_location = self.location or os.getenv('GOOGLE_CLOUD_LOCATION') or os.getenv('VERTEX_AI_LOCATION') or 'us-central1'
 
-    self._client = genai.Client(api_key=self.api_key)
+      if not project_id:
+        # Try to get project from ADC
+        try:
+          # pylint: disable=import-outside-toplevel
+          import google.auth  # type: ignore
+          _, detected_project = google.auth.default()
+          project_id = detected_project
+        except Exception:
+          project_id = None
+
+      if not project_id:
+        raise exceptions.InferenceConfigError(
+            'Gemini API key not provided and no Google Cloud project detected. '
+            'To use Vertex AI, authenticate with "gcloud auth application-default login" '
+            'and set a project (e.g., export GOOGLE_CLOUD_PROJECT=YOUR_PROJECT) or '
+            'pass project/location to the provider.'
+        )
+
+      try:
+        self._client = genai.Client(vertexai=True, project=project_id, location=resolved_location)
+      except Exception as e:
+        raise exceptions.InferenceConfigError(
+            f'Failed to initialize Vertex AI client (project={project_id}, location={resolved_location}). '
+            'Ensure ADC is configured and Vertex AI API is enabled.'
+        ) from e
 
     super().__init__(
         constraint=schema.Constraint(constraint_type=schema.ConstraintType.NONE)
